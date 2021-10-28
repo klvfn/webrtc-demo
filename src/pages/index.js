@@ -1,10 +1,12 @@
-import { useRef, useState, useMemo, useEffect } from 'react'
+import { useRef, useState, useMemo, useEffect, useCallback } from 'react'
 import config from '../../config'
 import { useCollection, useDocument, useRealtimeSnapshotCollection } from '../hooks/firebase'
 import { Flex, Heading, Text, UnorderedList, ListItem } from '@chakra-ui/react'
 import NewRecipient from '../components/new-recipient'
 import ModalText from '../components/modal-text'
 import ModalIncomingText from '../components/modal-incoming-text'
+import { v4 as uuid } from 'uuid'
+import { isEmpty } from 'lodash'
 
 export default function Home() {
   const peerRef = useRef({})
@@ -13,7 +15,7 @@ export default function Home() {
   const [incomingMessage, setIncomingMessage] = useState()
   const [otherRecipient, setOtherRecipient] = useState()
   const [currentRecipient, setCurrentRecipient] = useState()
-  const currentRecipientRef = useRef()
+  const currentRecipientIDRef = useRef()
   const recipientCol = useCollection()
   const recipientSnapshot = useRealtimeSnapshotCollection('recipients', false)
   const otherRecipientSnapshot = recipientSnapshot.data?.filter((recipient) => recipient.id !== currentRecipient?.id)
@@ -22,13 +24,13 @@ export default function Home() {
   const sessionSnapshot = useRealtimeSnapshotCollection('sessions', true)
   const incomingOfferSnapshot = useMemo(() => {
     const filteredSessionSnapshot = sessionSnapshot.data
-      ? sessionSnapshot.data.filter((sess) => sess.id.endsWith(currentRecipient?.id) && sess.offerer?.offer)
+      ? sessionSnapshot.data.filter((sess) => sess.answerer.id === currentRecipient?.id && sess.offerer?.offer)
       : []
     return filteredSessionSnapshot.length > 0 ? filteredSessionSnapshot[filteredSessionSnapshot.length - 1] : {}
   }, [sessionSnapshot.data, currentRecipient?.id])
   const incomingAnswerSnapshot = useMemo(() => {
     const filteredSessionSnapshot = sessionSnapshot.data
-      ? sessionSnapshot.data.filter((sess) => sess.id.startsWith(currentRecipient?.id) && sess.answerer?.answer)
+      ? sessionSnapshot.data.filter((sess) => sess.offerer.id === currentRecipient?.id && sess.answerer?.answer)
       : []
     return filteredSessionSnapshot.length > 0 ? filteredSessionSnapshot[filteredSessionSnapshot.length - 1] : {}
   }, [sessionSnapshot.data, currentRecipient?.id])
@@ -42,45 +44,96 @@ export default function Home() {
       id,
       ...recipient
     })
-    currentRecipientRef.current = {
-      id,
-      ...recipient
-    }
+    currentRecipientIDRef.current = id
   }
 
-  const createPeer = (localRecipientID) => {
-    const peer = new RTCPeerConnection(config.rtcConfig)
-    peer.onicecandidate = (e) => {
-      const handleIceCandidate = async (candidate, recipientID) => {
-        await iceCandidateCol.createDoc(`icecandidates/${recipientID}/candidates`, candidate)
+  const createPeer = useCallback(
+    (currentRecipient, sessionID, otherRecipient, isOfferer, message) => {
+      const peer = new RTCPeerConnection(config.rtcConfig)
+
+      // Attach events
+      peer.onicecandidate = (e) => {
+        const handleIceCandidate = async (candidate, recipientID) => {
+          await iceCandidateCol.createDoc(`icecandidates/${recipientID}/candidates`, { candidate })
+        }
+        if (e.candidate) {
+          handleIceCandidate(e.candidate.toJSON(), currentRecipient.id)
+        }
       }
-      if (e.candidate) {
-        handleIceCandidate(e.candidate.toJSON(), localRecipientID)
+
+      peer.oniceconnectionstatechange = (e) => {
+        console.log(`RTC: ice connection state ${peer.iceConnectionState}`)
+        if (peer.iceConnectionState === 'disconnected') {
+          if (peerRef.current[sessionID]) {
+            delete peerRef.current[sessionID]
+          }
+        }
+      }
+
+      peer.onconnectionstatechange = (e) => console.log(`RTC: connection state ${peer.connectionState}`)
+      peer.onsignalingstatechange = (e) => console.log(`RTC: signaling state ${peer.signalingState}`)
+
+      // Initiate data channel and attach events
+      if (isOfferer) {
+        const dc = peer.createDataChannel('data-channel')
+        peer.dc = dc
+        peer.dc.onopen = () => {
+          console.log(`RTC: channel opened with ${otherRecipient.name}`)
+          peer.dc.send(message)
+        }
+        peer.dc.onclose = () => {
+          console.log(`RTC: channel closed ${otherRecipient.name}`)
+        }
+        peer.dc.onmessage = (e) => {
+          setIncomingMessage(e.data)
+          setIsModalIncomingOpen(true)
+        }
+      } else {
+        peer.ondatachannel = (e) => {
+          peer.dc = e.channel
+          peer.dc.onopen = () => {
+            console.log(`RTC: channel opened with ${otherRecipient.name}`)
+          }
+          peer.dc.onclose = () => {
+            console.log(`RTC: channel closed ${otherRecipient.name}`)
+          }
+          peer.dc.onmessage = (e) => {
+            setIncomingMessage(e.data)
+            setIsModalIncomingOpen(true)
+          }
+        }
+      }
+
+      // Attach additional data
+      peer.offererID = currentRecipient.id
+      peer.answererID = otherRecipient.id
+
+      return peer
+    },
+    [iceCandidateCol]
+  )
+
+  const findExistingPeer = (currentRecipientID, otherRecipientID) => {
+    let sessionID = ''
+    if (!isEmpty(peerRef.current)) {
+      for (const id in peerRef.current) {
+        const peer = peerRef.current[id]
+        if (
+          (peer.offererID === currentRecipientID && peer.answererID === otherRecipientID) ||
+          (peer.offererID === otherRecipientID && peer.answererID === currentRecipientID)
+        ) {
+          sessionID = id
+        }
       }
     }
-    peer.oniceconnectionstatechange = (e) => console.log(`RTC: ice connection state ${peer.iceConnectionState}`)
-    peer.onconnectionstatechange = (e) => console.log(`RTC: connection state ${peer.connectionState}`)
-    peer.onsignalingstatechange = (e) => console.log(`RTC: signaling state ${peer.signalingState}`)
-    return peer
+    return sessionID
   }
 
   const handleSendMessage = async (message) => {
-    const sessionID = `${currentRecipient.id}-${otherRecipient.id}`
+    const sessionID = findExistingPeer(currentRecipient.id, otherRecipient.id) || uuid()
     if (!peerRef.current[sessionID]) {
       // Create peer
-      peerRef.current[sessionID] = createPeer(currentRecipient.id)
-      peerRef.current[sessionID].as = 'offerer'
-
-      // Initiate data channel
-      const dc = peerRef.current[sessionID].createDataChannel('data-channel')
-      dc.onopen = (e) => {
-        console.log(`RTC: channel opened with ${otherRecipient.name}`)
-        dc.send(message)
-      }
-      dc.onclose = (e) => {
-        console.log(`RTC: channel closed ${otherRecipient.name}`)
-      }
-      peerRef.current[sessionID].dc = dc
+      peerRef.current[sessionID] = createPeer(currentRecipient, sessionID, otherRecipient, true, message)
 
       // Initiate offer
       const offer = await peerRef.current[sessionID].createOffer()
@@ -92,59 +145,15 @@ export default function Home() {
           ...currentRecipient,
           offer: offer.toJSON()
         },
+        answerer: {
+          ...otherRecipient
+        },
         status: 'offered'
       })
-      setOtherRecipient()
     } else {
       peerRef.current[sessionID].dc.send(message)
-      await sessionDoc.upsert(`sessions/${sessionID}`, {
-        status: 'text-sent'
-      })
-      setOtherRecipient()
     }
-  }
-
-  const handleAcceptMessage = async (offerer) => {
-    const sessionID = `${offerer.id}-${currentRecipient.id}`
-    if (!peerRef.current[sessionID]) {
-      // Create peer
-      peerRef.current[sessionID] = createPeer(currentRecipient.id)
-      peerRef.current[sessionID].as = 'answerer'
-
-      // Attach data channel
-      peerRef.current[sessionID].ondatachannel = (e) => {
-        console.log(`RTC: channel opened with ${offerer.name}`)
-        peerRef.current[sessionID].dc = e.channel
-        peerRef.current[sessionID].dc.onmessage = (ev) => {
-          setIncomingMessage(ev.data)
-          setIsModalIncomingOpen(true)
-        }
-      }
-
-      // Attach remote description
-      await peerRef.current[sessionID].setRemoteDescription(new RTCSessionDescription(offerer.offer))
-
-      // Initiate answer
-      const answer = await peerRef.current[sessionID].createAnswer()
-      await peerRef.current[sessionID].setLocalDescription(answer)
-      await sessionDoc.upsert(`sessions/${offerer.id}-${currentRecipient.id}`, {
-        answerer: {
-          ...currentRecipient,
-          answer: answer.toJSON()
-        },
-        status: 'answered'
-      })
-
-      // Collecting ice candidate from the offerer
-      const candidates = await iceCandidateCol.get(`icecandidates/${offerer.id}/candidates`)
-      for (const candidate of candidates) {
-        await peerRef.current[sessionID].addIceCandidate(new RTCIceCandidate(candidate))
-      }
-    } else {
-      await sessionDoc.upsert(`sessions/${sessionID}`, {
-        status: 'text-received'
-      })
-    }
+    setOtherRecipient()
   }
 
   const handleChooseRecipient = (otherRecipient) => {
@@ -155,58 +164,70 @@ export default function Home() {
   // Handle incoming answer
   useEffect(() => {
     if (incomingAnswerSnapshot.status === 'answered') {
-      const sessionID = `${currentRecipient.id}-${incomingAnswerSnapshot.answerer.id}`
-      const handleAcceptIncomingAnswer = async (answerer) => {
+      const handleIncomingAnswer = async () => {
+        const { answerer, id: sessionID } = incomingAnswerSnapshot
         // Attach remote description
         await peerRef.current[sessionID].setRemoteDescription(new RTCSessionDescription(answerer.answer))
 
         // Collecting ice candidate from answerer
         const candidates = await iceCandidateCol.get(`icecandidates/${answerer.id}/candidates`)
-        for (const candidate of candidates) {
-          await peerRef.current[sessionID].addIceCandidate(new RTCIceCandidate(candidate))
+        for (const ice of candidates) {
+          await peerRef.current[sessionID].addIceCandidate(new RTCIceCandidate(ice.candidate))
+          await sessionDoc.remove(`icecandidates/${answerer.id}/candidates/${ice.id}`)
         }
-
-        await sessionDoc.upsert(`sessions/${sessionID}`, {
-          status: 'connected'
-        })
+        await sessionDoc.remove(`sessions/${sessionID}`)
       }
-      handleAcceptIncomingAnswer(incomingAnswerSnapshot.answerer)
+      handleIncomingAnswer()
     }
-  }, [incomingAnswerSnapshot?.status])
+  }, [incomingAnswerSnapshot.status])
 
-  // Handle accept message
+  // Handle incoming offer
   useEffect(() => {
-    if (incomingOfferSnapshot.status === 'offered' || incomingOfferSnapshot.status === 'text-sent') {
-      handleAcceptMessage(incomingOfferSnapshot.offerer)
-    }
-  }, [incomingOfferSnapshot?.status])
+    if (incomingOfferSnapshot.status === 'offered') {
+      const handleIncomingOffer = async () => {
+        const { offerer, id: sessionID } = incomingOfferSnapshot
+        if (!peerRef.current[sessionID]) {
+          // Create peer
+          peerRef.current[sessionID] = createPeer(currentRecipient, sessionID, offerer, false)
 
+          // Attach remote description
+          await peerRef.current[sessionID].setRemoteDescription(new RTCSessionDescription(offerer.offer))
+
+          // Initiate answer
+          const answer = await peerRef.current[sessionID].createAnswer()
+          await peerRef.current[sessionID].setLocalDescription(answer)
+          await sessionDoc.upsert(`sessions/${sessionID}`, {
+            answerer: {
+              ...currentRecipient,
+              answer: answer.toJSON()
+            },
+            status: 'answered'
+          })
+
+          // Collecting ice candidate from the offerer
+          const candidates = await iceCandidateCol.get(`icecandidates/${offerer.id}/candidates`)
+          for (const ice of candidates) {
+            await peerRef.current[sessionID].addIceCandidate(new RTCIceCandidate(ice.candidate))
+            await sessionDoc.remove(`icecandidates/${offerer.id}/candidates/${ice.id}`)
+          }
+        }
+      }
+      handleIncomingOffer()
+    }
+  }, [incomingOfferSnapshot.status])
+
+  // Handle cleanup recipient
   useEffect(() => {
     const handleBeforeUnload = () => {
-      const disconnect = async () => {
-        const promises = []
-        if (currentRecipientRef.current) {
-          promises.push(
-            sessionDoc.remove(`recipients/${currentRecipientRef.current.id}`),
-            sessionDoc.remove(`icecandidates/${currentRecipientRef.current.id}`)
-          )
-        }
-
-        if (peerRef.current) {
-          Object.keys(peerRef.current).map((s) => promises.push(sessionDoc.remove(`sessions/${s}`)))
-        }
-
-        if (promises.length > 0) {
-          await Promise.all(promises)
-        }
+      if (currentRecipientIDRef.current) {
+        sessionDoc.remove(`recipients/${currentRecipientIDRef.current}`).then(() => {})
       }
-      disconnect()
     }
     window.addEventListener('beforeunload', handleBeforeUnload)
     return () => {
       window.removeEventListener('beforeunload', handleBeforeUnload)
     }
-  }, [])
+  }, [sessionDoc])
 
   return (
     <Flex justify='center' direction='column' align='center' textAlign='left' height='100vh'>
@@ -225,11 +246,7 @@ export default function Home() {
             <Text as='b' color='teal.400'>
               left click
             </Text>
-            &nbsp;to send text or&nbsp;
-            <Text as='b' color='teal.400'>
-              right click
-            </Text>
-            &nbsp;to send files
+            &nbsp;to send text
           </Text>
         </Flex>
       )}
