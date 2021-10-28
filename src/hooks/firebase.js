@@ -108,7 +108,7 @@ export const useCollection = () => {
       const q = query(collection(firestoreRef.current, collectionID))
       const snapshot = await getDocs(q)
       const data = []
-      snapshot.forEach((doc) => data.push(doc.data()))
+      snapshot.forEach((doc) => data.push({ id: doc.id, ...doc.data() }))
       setState({
         isLoading: false
       })
