@@ -12,12 +12,12 @@ const config = {
     ]
   },
   firebaseConfig: {
-    apiKey: 'AIzaSyB7-6Ki2Lzu8r5FdOoI913vfkjBBZhLgoA',
-    authDomain: 'webrtc-demo-6032c.firebaseapp.com',
-    projectId: 'webrtc-demo-6032c',
-    storageBucket: 'webrtc-demo-6032c.appspot.com',
-    messagingSenderId: '220931895626',
-    appId: '1:220931895626:web:4cbab4ccdb7f146332d1b3'
+    apiKey: '',
+    authDomain: '',
+    projectId: '',
+    storageBucket: '',
+    messagingSenderId: '',
+    appId: ''
   }
 }
 
